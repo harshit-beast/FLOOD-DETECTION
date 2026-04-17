@@ -14,7 +14,11 @@ from data_loader import load_dataset
 from evaluate import evaluate_model, plot_confusion_matrix, plot_roc_curve
 from model import predict_flood_risk, train_random_forest, train_xgboost
 from preprocess import split_features_target, split_train_test
-from weather_api import fetch_hourly_weather_history, fetch_weather_for_location
+from weather_api import (
+    WeatherAPIRateLimitError,
+    fetch_hourly_weather_history,
+    fetch_weather_for_location,
+)
 
 
 REASON_FACTOR_MAP = {
@@ -37,6 +41,28 @@ QUICK_AREA_OPTIONS = [
     "Tokyo",
     "Custom",
 ]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_fetch_weather_for_location(location_name: str) -> Dict[str, Any]:
+    """Cache recent live weather fetches to reduce API calls."""
+    return fetch_weather_for_location(location_name)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_fetch_hourly_weather_history(
+    latitude: float,
+    longitude: float,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    """Cache historical weather requests for repeated area/date runs."""
+    return fetch_hourly_weather_history(
+        latitude=latitude,
+        longitude=longitude,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -456,10 +482,10 @@ def render_realtime_tab() -> None:
 
         try:
             with st.spinner("Fetching weather history, training model, and predicting..."):
-                weather = fetch_weather_for_location(location)
+                weather = cached_fetch_weather_for_location(location)
                 end_dt = date.today() - timedelta(days=1)
                 start_dt = end_dt - timedelta(days=history_days - 1)
-                history = fetch_hourly_weather_history(
+                history = cached_fetch_hourly_weather_history(
                     latitude=float(weather["latitude"]),
                     longitude=float(weather["longitude"]),
                     start_date=start_dt.isoformat(),
@@ -487,6 +513,25 @@ def render_realtime_tab() -> None:
                 "date_window": f"{start_dt.isoformat()} to {end_dt.isoformat()}",
             }
             st.session_state["last_prediction"] = {"class": pred, "probability": prob}
+            st.session_state["last_realtime_key"] = (
+                location.strip().lower(),
+                selected_reason,
+                int(history_days),
+            )
+        except WeatherAPIRateLimitError as exc:
+            cooldown = (
+                f"Please wait about {exc.wait_seconds} seconds and retry."
+                if exc.wait_seconds
+                else "Please wait a short while and retry."
+            )
+            st.warning(f"Weather API is busy (HTTP 429). {cooldown}")
+
+            last_payload = st.session_state.get("last_realtime_prediction")
+            last_key = st.session_state.get("last_realtime_key")
+            current_key = (location.strip().lower(), selected_reason, int(history_days))
+            if not last_payload or last_key != current_key:
+                return
+            st.info("Showing your most recent successful result for the same selection.")
         except Exception as exc:
             st.error(f"Live weather training/prediction failed: {exc}")
             return

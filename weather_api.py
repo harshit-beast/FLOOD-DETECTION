@@ -3,23 +3,79 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+DEFAULT_HEADERS = {"User-Agent": "FloodDetectionApp/1.0 (streamlit)"}
 
 
-def _get_json(url: str, params: Dict[str, Any], timeout: int = 12) -> Dict[str, Any]:
+class WeatherAPIRateLimitError(RuntimeError):
+    """Raised when the weather API returns HTTP 429 after retries."""
+
+    def __init__(self, wait_seconds: int | None = None):
+        self.wait_seconds = wait_seconds
+        if wait_seconds:
+            super().__init__(f"Rate limited by weather API. Retry after about {wait_seconds} seconds.")
+        else:
+            super().__init__("Rate limited by weather API. Please retry in a short while.")
+
+
+def _parse_retry_after(header_value: str | None, fallback_seconds: float) -> int:
+    """Parse Retry-After header value into a whole-second wait duration."""
+    if not header_value:
+        return max(1, int(round(fallback_seconds)))
+    try:
+        return max(1, int(float(header_value)))
+    except ValueError:
+        return max(1, int(round(fallback_seconds)))
+
+
+def _get_json(
+    url: str,
+    params: Dict[str, Any],
+    timeout: int = 12,
+    retries: int = 3,
+    backoff_seconds: float = 1.5,
+) -> Dict[str, Any]:
     """Run a GET request and decode a JSON response."""
     query = urlencode(params, doseq=True)
     endpoint = f"{url}?{query}"
-    with urlopen(endpoint, timeout=timeout) as response:  # noqa: S310 - trusted API endpoint.
-        payload = response.read()
-    return json.loads(payload.decode("utf-8"))
+    request = Request(endpoint, headers=DEFAULT_HEADERS)
+
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - trusted API endpoint.
+                payload = response.read()
+            return json.loads(payload.decode("utf-8"))
+        except HTTPError as exc:
+            should_retry = attempt < retries
+            wait_guess = backoff_seconds * (2**attempt)
+
+            if exc.code == 429:
+                wait_seconds = _parse_retry_after(exc.headers.get("Retry-After"), wait_guess)
+                if should_retry:
+                    time.sleep(wait_seconds)
+                    continue
+                raise WeatherAPIRateLimitError(wait_seconds=wait_seconds) from exc
+
+            if 500 <= exc.code <= 599 and should_retry:
+                time.sleep(wait_guess)
+                continue
+            raise
+        except URLError:
+            if attempt < retries:
+                time.sleep(backoff_seconds * (2**attempt))
+                continue
+            raise
+
+    raise RuntimeError("Unexpected API retry loop exit.")
 
 
 def geocode_location(location_name: str) -> Dict[str, Any]:
