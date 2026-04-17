@@ -79,12 +79,13 @@ Dashboard tabs:
 - `Data`: dataset preview and column details
 - `Training`: train/retrain and view model metrics/plots
 - `Prediction`: enter feature values and get flood risk prediction
-- `Realtime`: fetch live weather for a city/area and run flood prediction instantly
+- `Realtime`: select area + risk reason, auto-train on fetched weather history, and predict instantly
 
 Realtime notes:
 - Uses [Open-Meteo](https://open-meteo.com/) geocoding + forecast API.
 - No API key is required.
-- The model maps available weather fields into matching feature columns and fills remaining columns from dataset baseline values.
+- Automatically fetches recent hourly weather history for the selected area and retrains a local model before prediction.
+- User only needs to select area and reason (plus optional lookback days in Advanced settings).
 - If `data/flood_data.csv` is missing on deploy, the app auto-generates a sample dataset.
 
 ## Public Deployment

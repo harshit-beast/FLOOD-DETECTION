@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict
@@ -13,7 +14,29 @@ from data_loader import load_dataset
 from evaluate import evaluate_model, plot_confusion_matrix, plot_roc_curve
 from model import predict_flood_risk, train_random_forest, train_xgboost
 from preprocess import split_features_target, split_train_test
-from weather_api import fetch_weather_for_location
+from weather_api import fetch_hourly_weather_history, fetch_weather_for_location
+
+
+REASON_FACTOR_MAP = {
+    "Heavy Rain": 1.0,
+    "River Overflow": 1.2,
+    "Urban Drainage Issue": 1.1,
+    "Coastal Storm Surge": 1.15,
+    "Landslide-prone Area": 1.05,
+}
+
+QUICK_AREA_OPTIONS = [
+    "Mumbai",
+    "Delhi",
+    "Bengaluru",
+    "Kolkata",
+    "Chennai",
+    "Hyderabad",
+    "New York",
+    "London",
+    "Tokyo",
+    "Custom",
+]
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -157,6 +180,106 @@ def build_realtime_feature_row(
         weather_mapped[col] = float(derived)
 
     return row, weather_mapped
+
+
+def build_api_training_dataset(hourly_history: Dict[str, list[Any]], reason: str) -> pd.DataFrame:
+    """Aggregate hourly history into daily rows and generate flood labels for training."""
+    df = pd.DataFrame(hourly_history)
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"])
+    if df.empty:
+        raise ValueError("Historical weather response is empty after parsing timestamps.")
+
+    df["date"] = df["time"].dt.date
+    numeric_cols = [
+        "temperature_2m",
+        "relative_humidity_2m",
+        "precipitation",
+        "wind_speed_10m",
+        "surface_pressure",
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0.0)
+
+    daily = (
+        df.groupby("date", as_index=False)
+        .agg(
+            rainfall_24h_mm=("precipitation", "sum"),
+            temperature_c=("temperature_2m", "mean"),
+            humidity_pct=("relative_humidity_2m", "mean"),
+            wind_speed_kmh=("wind_speed_10m", "max"),
+            surface_pressure_hpa=("surface_pressure", "mean"),
+        )
+        .sort_values("date")
+    )
+
+    reason_factor = float(REASON_FACTOR_MAP.get(reason, 1.0))
+    daily["soil_moisture_proxy"] = (0.7 * daily["rainfall_24h_mm"] + 0.3 * (daily["humidity_pct"] / 2.0)).clip(
+        lower=0.0
+    )
+    daily["runoff_index"] = (
+        0.65 * daily["rainfall_24h_mm"] + 0.2 * daily["humidity_pct"] + 0.15 * daily["wind_speed_kmh"]
+    ).clip(lower=0.0)
+    daily["reason_factor"] = reason_factor
+
+    daily["flood_score"] = (
+        0.11 * daily["rainfall_24h_mm"]
+        + 0.03 * daily["humidity_pct"]
+        + 0.06 * daily["soil_moisture_proxy"]
+        + 0.02 * daily["runoff_index"]
+        + 0.01 * daily["wind_speed_kmh"]
+        - 0.02 * daily["temperature_c"]
+        + 3.0 * daily["reason_factor"]
+    )
+    threshold = float(daily["flood_score"].quantile(0.70))
+    daily["flood"] = (daily["flood_score"] >= threshold).astype(int)
+    if daily["flood"].nunique() < 2:
+        fallback_threshold = float(daily["flood_score"].median())
+        daily["flood"] = (daily["flood_score"] >= fallback_threshold).astype(int)
+        if daily["flood"].nunique() < 2:
+            raise ValueError("Unable to create a trainable target from fetched weather history.")
+
+    return daily[
+        [
+            "rainfall_24h_mm",
+            "temperature_c",
+            "humidity_pct",
+            "wind_speed_kmh",
+            "surface_pressure_hpa",
+            "soil_moisture_proxy",
+            "runoff_index",
+            "reason_factor",
+            "flood",
+        ]
+    ]
+
+
+def build_live_feature_row(weather: Dict[str, float], reason: str) -> pd.DataFrame:
+    """Build a single-row feature frame for current prediction from live weather values."""
+    rainfall = float(weather.get("rainfall_24h_mm", 0.0))
+    humidity = float(weather.get("humidity_pct", 0.0))
+    temperature = float(weather.get("temperature_c", 0.0))
+    wind_speed = float(weather.get("wind_speed_kmh", 0.0))
+    pressure = float(weather.get("surface_pressure_hpa", 0.0))
+    reason_factor = float(REASON_FACTOR_MAP.get(reason, 1.0))
+
+    soil_moisture_proxy = max(0.0, 0.7 * rainfall + 0.3 * (humidity / 2.0))
+    runoff_index = max(0.0, 0.65 * rainfall + 0.2 * humidity + 0.15 * wind_speed)
+
+    return pd.DataFrame(
+        [
+            {
+                "rainfall_24h_mm": rainfall,
+                "temperature_c": temperature,
+                "humidity_pct": humidity,
+                "wind_speed_kmh": wind_speed,
+                "surface_pressure_hpa": pressure,
+                "soil_moisture_proxy": soil_moisture_proxy,
+                "runoff_index": runoff_index,
+                "reason_factor": reason_factor,
+            }
+        ]
+    )
 
 
 def render_header() -> None:
@@ -311,63 +434,76 @@ def render_prediction_tab(df: pd.DataFrame) -> None:
 
 
 def render_realtime_tab() -> None:
-    """Fetch live weather by location and run an immediate flood-risk prediction."""
-    st.subheader("Real-Time Weather Prediction")
-    st.caption("Uses Open-Meteo API and maps weather signals into the trained model features.")
+    """Train from fetched weather history and predict risk for current conditions."""
+    st.subheader("Real-Time Smart Prediction")
+    st.caption("Select area and reason. The app fetches weather history, trains automatically, then predicts.")
 
-    required_keys = {"model", "feature_columns", "feature_baseline", "feature_stats"}
-    if not required_keys.issubset(st.session_state.keys()):
-        st.info("Train models first in the Training tab.")
-        return
+    chosen_area = st.selectbox("Select Area", QUICK_AREA_OPTIONS, index=0, key="quick_area")
+    custom_area = ""
+    if chosen_area == "Custom":
+        custom_area = st.text_input("Enter Custom Area", value="", key="custom_area")
 
-    default_location = st.session_state.get("realtime_location", "New York")
-    left, right = st.columns([3, 1])
-    with left:
-        location_query = st.text_input("City / Area", value=default_location, key="realtime_location")
-    with right:
-        fetch_now = st.button("Fetch & Predict", type="primary", use_container_width=True)
+    selected_reason = st.selectbox("Primary Risk Reason", list(REASON_FACTOR_MAP.keys()), index=0)
 
-    if fetch_now:
-        if not location_query.strip():
-            st.error("Enter a location to fetch weather.")
+    with st.expander("Advanced", expanded=False):
+        history_days = st.slider("Training lookback days", min_value=30, max_value=365, value=120, step=15)
+
+    if st.button("Train from API & Predict", type="primary", use_container_width=True):
+        location = custom_area.strip() if chosen_area == "Custom" else chosen_area
+        if not location:
+            st.error("Please enter an area name.")
             return
 
         try:
-            with st.spinner("Fetching live weather and running prediction..."):
-                weather = fetch_weather_for_location(location_query.strip())
-                feature_row, mapped = build_realtime_feature_row(
-                    feature_columns=st.session_state["feature_columns"],
-                    feature_baseline=st.session_state["feature_baseline"],
-                    feature_stats=st.session_state["feature_stats"],
-                    weather=weather,
+            with st.spinner("Fetching weather history, training model, and predicting..."):
+                weather = fetch_weather_for_location(location)
+                end_dt = date.today() - timedelta(days=1)
+                start_dt = end_dt - timedelta(days=history_days - 1)
+                history = fetch_hourly_weather_history(
+                    latitude=float(weather["latitude"]),
+                    longitude=float(weather["longitude"]),
+                    start_date=start_dt.isoformat(),
+                    end_date=end_dt.isoformat(),
                 )
-                sample = pd.DataFrame([feature_row])
-                result = predict_flood_risk(st.session_state["model"], sample)
-                pred = int(result["predictions"][0])
-                prob = float(result["probabilities"][0])
+
+                train_df = build_api_training_dataset(history, selected_reason)
+                X, y = split_features_target(train_df, target_column="flood")
+                X_train, X_test, y_train, y_test = split_train_test(X, y, test_size=0.2, random_state=42)
+                live_model = train_random_forest(X_train, y_train)
+                live_metrics = evaluate_model(live_model, X_test, y_test)
+
+                live_row = build_live_feature_row(weather, selected_reason)
+                live_result = predict_flood_risk(live_model, live_row)
+                pred = int(live_result["predictions"][0])
+                prob = float(live_result["probabilities"][0])
 
             st.session_state["last_realtime_prediction"] = {
                 "prediction_class": pred,
                 "prediction_probability": prob,
                 "weather": weather,
-                "mapped_features": mapped,
+                "metrics": live_metrics,
+                "training_rows": int(len(train_df)),
+                "reason": selected_reason,
+                "date_window": f"{start_dt.isoformat()} to {end_dt.isoformat()}",
             }
             st.session_state["last_prediction"] = {"class": pred, "probability": prob}
         except Exception as exc:
-            st.error(f"Live weather prediction failed: {exc}")
+            st.error(f"Live weather training/prediction failed: {exc}")
             return
 
     if "last_realtime_prediction" not in st.session_state:
-        st.info("Click `Fetch & Predict` to run a live weather-based prediction.")
+        st.info("Pick area and reason, then click `Train from API & Predict`.")
         return
 
     payload = st.session_state["last_realtime_prediction"]
     weather = payload["weather"]
-    mapped_features = payload["mapped_features"]
     pred = payload["prediction_class"]
     prob = payload["prediction_probability"]
+    metrics = payload["metrics"]
 
     st.write(f"Location: **{weather['location']}** ({weather['latitude']:.3f}, {weather['longitude']:.3f})")
+    st.caption(f"Reason: {payload['reason']} | Training window: {payload['date_window']}")
+
     w1, w2, w3, w4 = st.columns(4)
     w1.metric("Temperature (C)", f"{weather['temperature_c']:.1f}")
     w2.metric("Humidity (%)", f"{weather['humidity_pct']:.1f}")
@@ -383,20 +519,13 @@ def render_realtime_tab() -> None:
     else:
         st.success("Low flood risk predicted for current weather conditions.")
 
-    total_features = len(st.session_state["feature_columns"])
-    mapped_count = len(mapped_features)
-    st.caption(
-        f"Weather mapped into {mapped_count}/{total_features} model features. "
-        "Remaining features used training-data baseline values."
-    )
+    st.caption(f"Model retrained on {payload['training_rows']} daily records fetched from weather API.")
 
-    with st.expander("Mapped Feature Values"):
-        st.dataframe(
-            pd.DataFrame(
-                [{"feature": k, "value": v} for k, v in sorted(mapped_features.items())]
-            ),
-            use_container_width=True,
-        )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Validation Accuracy", f"{metrics['accuracy']:.3f}")
+    m2.metric("Validation Precision", f"{metrics['precision']:.3f}")
+    m3.metric("Validation Recall", f"{metrics['recall']:.3f}")
+    m4.metric("Validation ROC-AUC", f"{metrics['roc_auc']:.3f}")
 
 
 def chatbot_response(user_text: str, df: pd.DataFrame) -> str:

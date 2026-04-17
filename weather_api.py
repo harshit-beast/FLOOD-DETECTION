@@ -10,6 +10,7 @@ from urllib.request import urlopen
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 
 def _get_json(url: str, params: Dict[str, Any], timeout: int = 12) -> Dict[str, Any]:
@@ -92,3 +93,29 @@ def fetch_weather_for_location(location_name: str) -> Dict[str, Any]:
         "longitude": float(geo["longitude"]),
         **weather,
     }
+
+
+def fetch_hourly_weather_history(
+    latitude: float,
+    longitude: float,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    """Fetch hourly historical weather used to train a location-specific flood model."""
+    response = _get_json(
+        ARCHIVE_URL,
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "start_date": start_date,
+            "end_date": end_date,
+            "timezone": "auto",
+            "hourly": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,surface_pressure",
+        },
+    )
+
+    hourly = response.get("hourly") or {}
+    if not hourly or not hourly.get("time"):
+        raise ValueError("No historical weather records were returned for this location/date range.")
+
+    return hourly
