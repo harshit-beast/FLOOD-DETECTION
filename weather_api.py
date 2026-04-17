@@ -175,3 +175,31 @@ def fetch_hourly_weather_history(
         raise ValueError("No historical weather records were returned for this location/date range.")
 
     return hourly
+
+
+def fetch_daily_weather_history(
+    latitude: float,
+    longitude: float,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    """Fetch daily historical weather; lighter payload than hourly for model training."""
+    response = _get_json(
+        ARCHIVE_URL,
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "start_date": start_date,
+            "end_date": end_date,
+            "timezone": "auto",
+            "daily": (
+                "temperature_2m_mean,relative_humidity_2m_mean,"
+                "precipitation_sum,wind_speed_10m_max,surface_pressure_mean"
+            ),
+        },
+    )
+
+    daily = response.get("daily") or {}
+    if not daily or not daily.get("time"):
+        raise ValueError("No daily historical weather records were returned for this location/date range.")
+    return daily

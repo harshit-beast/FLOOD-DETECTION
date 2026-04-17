@@ -7,6 +7,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -16,7 +17,8 @@ from model import predict_flood_risk, train_random_forest, train_xgboost
 from preprocess import split_features_target, split_train_test
 from weather_api import (
     WeatherAPIRateLimitError,
-    fetch_hourly_weather_history,
+    fetch_daily_weather_history,
+    fetch_live_weather,
     fetch_weather_for_location,
 )
 
@@ -42,6 +44,18 @@ QUICK_AREA_OPTIONS = [
     "Custom",
 ]
 
+AREA_COORDINATES = {
+    "Mumbai": {"latitude": 19.076, "longitude": 72.878, "location": "Mumbai, Maharashtra, India"},
+    "Delhi": {"latitude": 28.614, "longitude": 77.209, "location": "Delhi, India"},
+    "Bengaluru": {"latitude": 12.972, "longitude": 77.594, "location": "Bengaluru, Karnataka, India"},
+    "Kolkata": {"latitude": 22.572, "longitude": 88.364, "location": "Kolkata, West Bengal, India"},
+    "Chennai": {"latitude": 13.083, "longitude": 80.270, "location": "Chennai, Tamil Nadu, India"},
+    "Hyderabad": {"latitude": 17.385, "longitude": 78.486, "location": "Hyderabad, Telangana, India"},
+    "New York": {"latitude": 40.713, "longitude": -74.006, "location": "New York, New York, USA"},
+    "London": {"latitude": 51.507, "longitude": -0.128, "location": "London, England, UK"},
+    "Tokyo": {"latitude": 35.676, "longitude": 139.650, "location": "Tokyo, Japan"},
+}
+
 
 @st.cache_data(ttl=600, show_spinner=False)
 def cached_fetch_weather_for_location(location_name: str) -> Dict[str, Any]:
@@ -49,15 +63,21 @@ def cached_fetch_weather_for_location(location_name: str) -> Dict[str, Any]:
     return fetch_weather_for_location(location_name)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_fetch_hourly_weather_history(
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_fetch_live_weather(latitude: float, longitude: float) -> Dict[str, float]:
+    """Cache live weather by coordinates for quick-area presets."""
+    return fetch_live_weather(latitude=latitude, longitude=longitude)
+
+
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def cached_fetch_daily_weather_history(
     latitude: float,
     longitude: float,
     start_date: str,
     end_date: str,
 ) -> Dict[str, Any]:
-    """Cache historical weather requests for repeated area/date runs."""
-    return fetch_hourly_weather_history(
+    """Cache daily historical weather to minimize archive API pressure."""
+    return fetch_daily_weather_history(
         latitude=latitude,
         longitude=longitude,
         start_date=start_date,
@@ -209,35 +229,52 @@ def build_realtime_feature_row(
 
 
 def build_api_training_dataset(hourly_history: Dict[str, list[Any]], reason: str) -> pd.DataFrame:
-    """Aggregate hourly history into daily rows and generate flood labels for training."""
+    """Build daily train rows from historical weather API payload and generate labels."""
     df = pd.DataFrame(hourly_history)
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = df.dropna(subset=["time"])
     if df.empty:
-        raise ValueError("Historical weather response is empty after parsing timestamps.")
+        raise ValueError("Historical weather response is empty.")
 
-    df["date"] = df["time"].dt.date
-    numeric_cols = [
-        "temperature_2m",
-        "relative_humidity_2m",
-        "precipitation",
-        "wind_speed_10m",
-        "surface_pressure",
-    ]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0.0)
+    if "precipitation_sum" in df.columns:
+        # Daily schema from archive `daily=...` query.
+        daily = pd.DataFrame(
+            {
+                "date": pd.to_datetime(df.get("time"), errors="coerce").dt.date,
+                "rainfall_24h_mm": pd.to_numeric(df.get("precipitation_sum"), errors="coerce").fillna(0.0),
+                "temperature_c": pd.to_numeric(df.get("temperature_2m_mean"), errors="coerce").fillna(0.0),
+                "humidity_pct": pd.to_numeric(df.get("relative_humidity_2m_mean"), errors="coerce").fillna(0.0),
+                "wind_speed_kmh": pd.to_numeric(df.get("wind_speed_10m_max"), errors="coerce").fillna(0.0),
+                "surface_pressure_hpa": pd.to_numeric(df.get("surface_pressure_mean"), errors="coerce").fillna(0.0),
+            }
+        ).dropna(subset=["date"])
+    else:
+        # Backward-compatible hourly schema.
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df.dropna(subset=["time"])
+        if df.empty:
+            raise ValueError("Historical weather response is empty after parsing timestamps.")
 
-    daily = (
-        df.groupby("date", as_index=False)
-        .agg(
-            rainfall_24h_mm=("precipitation", "sum"),
-            temperature_c=("temperature_2m", "mean"),
-            humidity_pct=("relative_humidity_2m", "mean"),
-            wind_speed_kmh=("wind_speed_10m", "max"),
-            surface_pressure_hpa=("surface_pressure", "mean"),
+        df["date"] = df["time"].dt.date
+        numeric_cols = [
+            "temperature_2m",
+            "relative_humidity_2m",
+            "precipitation",
+            "wind_speed_10m",
+            "surface_pressure",
+        ]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0.0)
+
+        daily = (
+            df.groupby("date", as_index=False)
+            .agg(
+                rainfall_24h_mm=("precipitation", "sum"),
+                temperature_c=("temperature_2m", "mean"),
+                humidity_pct=("relative_humidity_2m", "mean"),
+                wind_speed_kmh=("wind_speed_10m", "max"),
+                surface_pressure_hpa=("surface_pressure", "mean"),
+            )
+            .sort_values("date")
         )
-        .sort_values("date")
-    )
 
     reason_factor = float(REASON_FACTOR_MAP.get(reason, 1.0))
     daily["soil_moisture_proxy"] = (0.7 * daily["rainfall_24h_mm"] + 0.3 * (daily["humidity_pct"] / 2.0)).clip(
@@ -306,6 +343,72 @@ def build_live_feature_row(weather: Dict[str, float], reason: str) -> pd.DataFra
             }
         ]
     )
+
+
+def build_offline_weather_snapshot(location: str) -> Dict[str, Any]:
+    """Create deterministic fallback weather when live API calls are unavailable."""
+    preset = AREA_COORDINATES.get(location)
+    if preset:
+        latitude = float(preset["latitude"])
+        longitude = float(preset["longitude"])
+        location_label = str(preset["location"])
+    else:
+        latitude = 0.0
+        longitude = 0.0
+        location_label = location
+
+    seed = sum(ord(ch) for ch in location.lower()) % 10_000
+    rng = np.random.default_rng(seed)
+    rainfall = float(rng.uniform(2.0, 32.0))
+    humidity = float(rng.uniform(55.0, 92.0))
+    temperature = float(rng.uniform(20.0, 34.0))
+    wind_speed = float(rng.uniform(6.0, 28.0))
+    pressure = float(rng.uniform(995.0, 1018.0))
+    soil = float(max(0.0, min(100.0, 0.9 * rainfall + 0.35 * humidity)))
+
+    return {
+        "location": f"{location_label} (offline estimate)",
+        "latitude": latitude,
+        "longitude": longitude,
+        "temperature_c": temperature,
+        "humidity_pct": humidity,
+        "precipitation_mm": rainfall / 24.0,
+        "rainfall_24h_mm": rainfall,
+        "soil_moisture_pct": soil,
+        "wind_speed_kmh": wind_speed,
+        "surface_pressure_hpa": pressure,
+    }
+
+
+def build_synthetic_daily_history(weather: Dict[str, Any], days: int = 120) -> Dict[str, list[Any]]:
+    """Generate lightweight synthetic daily history for resilient training fallback."""
+    base_temp = float(weather.get("temperature_c", 28.0))
+    base_humidity = float(weather.get("humidity_pct", 75.0))
+    base_rain = float(weather.get("rainfall_24h_mm", 12.0))
+    base_wind = float(weather.get("wind_speed_kmh", 12.0))
+    base_pressure = float(weather.get("surface_pressure_hpa", 1008.0))
+
+    seed = int(abs(base_temp * 100 + base_humidity * 10 + base_rain * 7 + base_wind * 5))
+    rng = np.random.default_rng(seed)
+    end_dt = date.today() - timedelta(days=1)
+    start_dt = end_dt - timedelta(days=max(30, days) - 1)
+    dates = pd.date_range(start_dt, end_dt, freq="D")
+    phase = np.linspace(0, 4 * np.pi, len(dates))
+
+    rain_series = np.clip(base_rain + 8 * np.sin(phase) + rng.normal(0, 3, len(dates)), 0, None)
+    humidity_series = np.clip(base_humidity + 10 * np.sin(phase + 0.6) + rng.normal(0, 4, len(dates)), 35, 100)
+    temp_series = np.clip(base_temp + 4 * np.cos(phase) + rng.normal(0, 1.5, len(dates)), 5, 45)
+    wind_series = np.clip(base_wind + 3 * np.sin(phase + 1.2) + rng.normal(0, 1.2, len(dates)), 0, None)
+    pressure_series = np.clip(base_pressure + 4 * np.cos(phase + 0.8) + rng.normal(0, 1.0, len(dates)), 970, 1040)
+
+    return {
+        "time": [d.date().isoformat() for d in dates],
+        "precipitation_sum": rain_series.round(3).tolist(),
+        "relative_humidity_2m_mean": humidity_series.round(3).tolist(),
+        "temperature_2m_mean": temp_series.round(3).tolist(),
+        "wind_speed_10m_max": wind_series.round(3).tolist(),
+        "surface_pressure_mean": pressure_series.round(3).tolist(),
+    }
 
 
 def render_header() -> None:
@@ -482,15 +585,40 @@ def render_realtime_tab() -> None:
 
         try:
             with st.spinner("Fetching weather history, training model, and predicting..."):
-                weather = cached_fetch_weather_for_location(location)
+                fallback_mode = ""
                 end_dt = date.today() - timedelta(days=1)
                 start_dt = end_dt - timedelta(days=history_days - 1)
-                history = cached_fetch_hourly_weather_history(
-                    latitude=float(weather["latitude"]),
-                    longitude=float(weather["longitude"]),
-                    start_date=start_dt.isoformat(),
-                    end_date=end_dt.isoformat(),
-                )
+
+                try:
+                    if chosen_area != "Custom" and chosen_area in AREA_COORDINATES:
+                        preset = AREA_COORDINATES[chosen_area]
+                        live_values = cached_fetch_live_weather(
+                            latitude=float(preset["latitude"]),
+                            longitude=float(preset["longitude"]),
+                        )
+                        weather = {
+                            "location": str(preset["location"]),
+                            "latitude": float(preset["latitude"]),
+                            "longitude": float(preset["longitude"]),
+                            **live_values,
+                        }
+                    else:
+                        weather = cached_fetch_weather_for_location(location)
+
+                    history = cached_fetch_daily_weather_history(
+                        latitude=float(weather["latitude"]),
+                        longitude=float(weather["longitude"]),
+                        start_date=start_dt.isoformat(),
+                        end_date=end_dt.isoformat(),
+                    )
+                except WeatherAPIRateLimitError:
+                    fallback_mode = "rate_limited"
+                    weather = build_offline_weather_snapshot(location)
+                    history = build_synthetic_daily_history(weather, days=history_days)
+                except Exception:
+                    fallback_mode = "api_unavailable"
+                    weather = build_offline_weather_snapshot(location)
+                    history = build_synthetic_daily_history(weather, days=history_days)
 
                 train_df = build_api_training_dataset(history, selected_reason)
                 X, y = split_features_target(train_df, target_column="flood")
@@ -511,27 +639,9 @@ def render_realtime_tab() -> None:
                 "training_rows": int(len(train_df)),
                 "reason": selected_reason,
                 "date_window": f"{start_dt.isoformat()} to {end_dt.isoformat()}",
+                "fallback_mode": fallback_mode,
             }
             st.session_state["last_prediction"] = {"class": pred, "probability": prob}
-            st.session_state["last_realtime_key"] = (
-                location.strip().lower(),
-                selected_reason,
-                int(history_days),
-            )
-        except WeatherAPIRateLimitError as exc:
-            cooldown = (
-                f"Please wait about {exc.wait_seconds} seconds and retry."
-                if exc.wait_seconds
-                else "Please wait a short while and retry."
-            )
-            st.warning(f"Weather API is busy (HTTP 429). {cooldown}")
-
-            last_payload = st.session_state.get("last_realtime_prediction")
-            last_key = st.session_state.get("last_realtime_key")
-            current_key = (location.strip().lower(), selected_reason, int(history_days))
-            if not last_payload or last_key != current_key:
-                return
-            st.info("Showing your most recent successful result for the same selection.")
         except Exception as exc:
             st.error(f"Live weather training/prediction failed: {exc}")
             return
@@ -545,6 +655,12 @@ def render_realtime_tab() -> None:
     pred = payload["prediction_class"]
     prob = payload["prediction_probability"]
     metrics = payload["metrics"]
+    fallback_mode = payload.get("fallback_mode", "")
+
+    if fallback_mode == "rate_limited":
+        st.warning("Weather API rate-limited the request. Showing resilient offline estimate for now.")
+    elif fallback_mode == "api_unavailable":
+        st.warning("Weather API is temporarily unavailable. Showing resilient offline estimate for now.")
 
     st.write(f"Location: **{weather['location']}** ({weather['latitude']:.3f}, {weather['longitude']:.3f})")
     st.caption(f"Reason: {payload['reason']} | Training window: {payload['date_window']}")

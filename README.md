@@ -84,9 +84,10 @@ Dashboard tabs:
 Realtime notes:
 - Uses [Open-Meteo](https://open-meteo.com/) geocoding + forecast API.
 - No API key is required.
-- Automatically fetches recent hourly weather history for the selected area and retrains a local model before prediction.
+- Automatically fetches daily weather history for the selected area and retrains a local model before prediction.
 - User only needs to select area and reason (plus optional lookback days in Advanced settings).
 - App includes retry/backoff + caching to handle temporary API rate limiting.
+- If weather API is unavailable/rate-limited, app switches to offline estimated weather + synthetic history so prediction still works.
 - If `data/flood_data.csv` is missing on deploy, the app auto-generates a sample dataset.
 
 ## Public Deployment
