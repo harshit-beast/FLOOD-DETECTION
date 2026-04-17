@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: flood-detection-dashboard
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run ui.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9

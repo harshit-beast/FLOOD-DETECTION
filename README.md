@@ -18,7 +18,7 @@ A modular Python project for flood risk prediction using tabular weather/river d
   - Confusion Matrix
   - ROC Curve
 - Predict flood risk for new data.
-- Streamlit dashboard for interactive upload, training, and prediction.
+- Streamlit dashboard for interactive upload, training, manual prediction, and real-time weather prediction via API.
 
 ## Project Structure
 
@@ -79,6 +79,38 @@ Dashboard tabs:
 - `Data`: dataset preview and column details
 - `Training`: train/retrain and view model metrics/plots
 - `Prediction`: enter feature values and get flood risk prediction
+- `Realtime`: fetch live weather for a city/area and run flood prediction instantly
+
+Realtime notes:
+- Uses [Open-Meteo](https://open-meteo.com/) geocoding + forecast API.
+- No API key is required.
+- The model maps available weather fields into matching feature columns and fills remaining columns from dataset baseline values.
+- If `data/flood_data.csv` is missing on deploy, the app auto-generates a sample dataset.
+
+## Public Deployment
+
+### Option 1: Streamlit Community Cloud (fastest)
+
+1. Push this repo to GitHub.
+2. Open [share.streamlit.io](https://share.streamlit.io/) and sign in with GitHub.
+3. Click **New app** and select:
+   - Repository: your `FLOOD-DETECTION` repo
+   - Branch: `main`
+   - Main file path: `ui.py`
+4. Click **Deploy**.
+
+Your app will be publicly available on a `*.streamlit.app` URL.
+
+### Option 2: Render
+
+This repo includes `render.yaml` for one-click setup.
+
+1. Push the latest code to GitHub.
+2. In Render, click **New +** -> **Blueprint**.
+3. Select this repository.
+4. Render will create `flood-detection-dashboard` automatically and deploy it.
+
+Your app will be publicly available on a `*.onrender.com` URL.
 
 ## Dataset Format
 
